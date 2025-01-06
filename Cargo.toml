@@ -1,0 +1,10 @@
+[package]
+name = "halo2-for-kzgewe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", branch = "main" }
+halo2curves = "0.7.0"
+plotters = "0.3"
+rand = "0.8"
