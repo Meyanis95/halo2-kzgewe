@@ -1,4 +1,4 @@
-use halo2curves::CurveAffine;
+use halo2_middleware::zal::impls::PlonkEngineConfig;
 use rand::rngs::OsRng;
 use std::io::Cursor;
 
@@ -6,17 +6,22 @@ use ark_ec::{pairing::Pairing, CurveGroup, VariableBaseMSM};
 
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
-    halo2curves::bn256::{Bn256, Fr, G1Affine},
+    halo2curves::{
+        bn256::{Bn256, Fr, G1Affine},
+        group::{prime::PrimeCurveAffine, Curve},
+        CurveAffine,
+    },
     plonk::{
-        create_proof, keygen_pk, keygen_vk, Advice, Circuit, Column, ConstraintSystem, ErrorFront,
+        create_proof, keygen_pk, keygen_vk, Circuit, ConstraintSystem, ErrorFront, Expression,
+        Selector,
     },
     poly::{
-        commitment::{CommitmentScheme, Params},
+        commitment::{Blind, CommitmentScheme, Params},
         kzg::{
             commitment::{KZGCommitmentScheme, ParamsKZG},
             multiopen::ProverGWC,
         },
-        EvaluationDomain,
+        EvaluationDomain, Rotation,
     },
     transcript::{
         Blake2bRead, Blake2bWrite, Challenge255, TranscriptRead, TranscriptReadBuffer,
@@ -28,7 +33,7 @@ use halo2_proofs::{
 fn extract_commitments<C: CommitmentScheme>(
     proof: &[u8],
     num_advice_columns: usize,
-) -> Vec<halo2curves::bn256::G1Affine> {
+) -> Vec<G1Affine> {
     // Initialize the transcript reader with the proof data
     let mut transcript =
         Blake2bRead::<std::io::Cursor<&[u8]>, _, Challenge255<_>>::init(Cursor::new(proof));
@@ -61,15 +66,15 @@ pub fn plain_kzg_com<E: Pairing>(ck: &CommitmentKey<E>, evals: &[E::ScalarField]
 /// A simple configuration struct that holds one Advice column.
 #[derive(Clone, Debug)]
 struct MyConfig {
-    advice_col: Column<Advice>,
+    advice_col: halo2_proofs::plonk::Column<halo2_proofs::plonk::Advice>,
+    q_bit: Selector,
 }
 
-/// A trivial circuit with just one witness `a`.
-/// In a real circuit, `a` could be something you want to prove knowledge of.
+/// In this circuit, `bitvector` could be something you want to prove knowledge of.
 #[derive(Clone, Debug)]
 struct BitvectorCommitmentCircuit {
     /// This will be our witness. We store it as a `Value<Fp>`.
-    bitvector: Vec<Value<Fr>>,
+    bitvector: Vec<Fr>,
 }
 
 impl Circuit<Fr> for BitvectorCommitmentCircuit {
@@ -78,9 +83,7 @@ impl Circuit<Fr> for BitvectorCommitmentCircuit {
 
     /// This is optional “empty” version of the circuit without witness values.
     fn without_witnesses(&self) -> Self {
-        Self {
-            bitvector: vec![Value::unknown()],
-        }
+        Self { bitvector: vec![] }
     }
 
     /// Configure is where you define circuit structure: which columns exist,
@@ -88,12 +91,19 @@ impl Circuit<Fr> for BitvectorCommitmentCircuit {
     fn configure(meta: &mut ConstraintSystem<Fr>) -> MyConfig {
         // Allocate a single advice column.
         let advice_col = meta.advice_column();
+        let q_bit = meta.selector();
 
-        // For demonstration, we enable equality on the advice column.
-        // This allows equality checks or copying the cell across rows or columns.
-        meta.enable_equality(advice_col);
+        // meta.enable_equality(advice_col);
 
-        MyConfig { advice_col }
+        // Add a constraint that the bit must be 0 or 1
+        meta.create_gate("bit constraint", |meta| {
+            let s = meta.query_selector(q_bit);
+            let bit = meta.query_advice(advice_col, Rotation::cur());
+
+            vec![s * bit.clone() * (bit - Expression::Constant(Fr::from(1u64)))]
+        });
+
+        MyConfig { advice_col, q_bit }
     }
 
     /// `synthesize` is where you lay out your circuit’s values.
@@ -102,31 +112,60 @@ impl Circuit<Fr> for BitvectorCommitmentCircuit {
         config: MyConfig,
         mut layouter: impl Layouter<Fr>,
     ) -> Result<(), ErrorFront> {
-        // Assign a value to the advice column in row 0.
         layouter.assign_region(
-            || "Assign bit vector",
+            || "assign bits",
             |mut region| {
                 for (i, bit) in self.bitvector.iter().enumerate() {
-                    region.assign_advice(|| format!("bit {}", i), config.advice_col, i, || *bit)?;
+                    // Enable q_bit selector on this row
+                    config.q_bit.enable(&mut region, i)?;
+                    region.assign_advice(|| "bit", config.advice_col, i, || Value::known(*bit))?;
                 }
                 Ok(())
             },
-        )?;
+        )
+    }
+}
 
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use halo2_proofs::dev::MockProver;
+
+    #[test]
+    fn test_circuit_layout() {
+        // 1. Define your circuit with the desired bitvector witness
+        let circuit = BitvectorCommitmentCircuit {
+            bitvector: vec![
+                Fr::zero(),
+                Fr::zero(),
+                Fr::one(),
+                Fr::one(),
+                Fr::zero(),
+                Fr::zero(),
+                Fr::one(),
+                Fr::one(),
+            ],
+        };
+
+        // 2. Create a MockProver (choose a power-of-two size, say 4 or 8, etc.)
+        let k = 4;
+        let prover = MockProver::run(k, &circuit, vec![]).unwrap();
+
+        // 3. Verify. If constraints fail, this returns an error with more context.
+        prover.assert_satisfied();
+
+        // Uncomment to print the advice column values for debug
+        // let advice_vals = prover.advice();
+        // println!("Printed Column: {:?}", &advice_vals);
     }
 }
 
 fn main() {
     // 1. Choose circuit size = 2^k
-    let k = 5;
+    let k = 4;
 
-    // 2. Define the bit vector we want to commit (e.g., [1, 0, 1])
-    let bitvector = vec![
-        Value::known(Fr::from(1u64)),
-        Value::known(Fr::from(0u64)),
-        Value::known(Fr::from(1u64)),
-    ];
+    // 2. Define the bit vector we want to commit (e.g., [1, 0, 1, 1])
+    let bitvector = vec![Fr::zero(), Fr::zero(), Fr::one(), Fr::one()];
 
     // 3. Create circuit instance with the bit vector
     let circuit = BitvectorCommitmentCircuit { bitvector };
@@ -168,34 +207,45 @@ fn main() {
     );
 
     // 10. Compute the commitment from the bitvector using plain KZG
-    let domain = EvaluationDomain::<Fr>::new(1, k);
+    let domain = EvaluationDomain::new(1, k);
 
-    let fresh_bitvector = vec![
-        Value::known(Fr::from(1u64)),
-        Value::known(Fr::from(0u64)),
-        Value::known(Fr::from(1u64)),
-    ];
+    let fresh_bitvector = vec![Fr::zero(), Fr::zero(), Fr::one(), Fr::one()];
 
     // Convert the bitvector into a polynomial in Lagrange basis
-    let mut poly = domain.empty_lagrange();
-    for (i, val) in fresh_bitvector.iter().enumerate() {
-        poly[i] = val.assign().unwrap();
+    let mut a = domain.empty_lagrange();
+    for (i, a) in a.iter_mut().enumerate() {
+        // *a = fresh_bitvector[i].assign().unwrap();
+        if i < fresh_bitvector.len() {
+            *a = fresh_bitvector[i];
+        } else {
+            *a = Fr::zero();
+        }
     }
 
-    println!("Polynomial: {:?}", poly);
+    // Compute the commitment using `ParamsKZG`'s `commit_lagrange` function,
+    // with default blinding factor and Plonk engine
+    let engine = PlonkEngineConfig::build_default::<G1Affine>();
+    let alpha = Blind::default();
 
-    // Compute the commitment using `ParamsKZG`'s `commit_lagrange` function
-    let engine = halo2_middleware::zal::impls::H2cEngine::new(); // Use the correct MsmAccel engine
-    let commitment = params.commit_lagrange(
-        &engine,
-        &poly,
-        halo2_proofs::poly::commitment::Blind(Fr::zero()),
+    let commitment = params.commit_lagrange(&engine.msm_backend, &a, alpha);
+
+    let mut advice_commitments_affine = vec![
+        <<KZGCommitmentScheme<Bn256> as CommitmentScheme>::Curve as PrimeCurveAffine>::identity(
+        );
+        1
+    ];
+
+    <<KZGCommitmentScheme<Bn256> as CommitmentScheme>::Curve as CurveAffine>::CurveExt::batch_normalize(
+            &[commitment],
+            &mut advice_commitments_affine,
+        );
+    let advice_commitments_affine = advice_commitments_affine;
+
+    println!(
+        "Commitment to the bitvector: {:?}",
+        advice_commitments_affine[0]
     );
 
-    let plain_commitment = G1Affine::from_xy(commitment.x, commitment.y).unwrap();
-
-    println!("Commitment to the bitvector: {:?}", plain_commitment);
-
     // Compare our commitments
-    assert_eq!(halo2_commitment, plain_commitment);
+    assert_eq!(halo2_commitment, advice_commitments_affine[0]);
 }
