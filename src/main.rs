@@ -90,10 +90,8 @@ impl Circuit<Fr> for BitvectorCommitmentCircuit {
     /// what selectors you need, and how constraints are applied.
     fn configure(meta: &mut ConstraintSystem<Fr>) -> MyConfig {
         // Allocate a single advice column.
-        let advice_col = meta.advice_column();
+        let advice_col = meta.unblinded_advice_column();
         let q_bit = meta.selector();
-
-        // meta.enable_equality(advice_col);
 
         // Add a constraint that the bit must be 0 or 1
         meta.create_gate("bit constraint", |meta| {
