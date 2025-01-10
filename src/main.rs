@@ -1,9 +1,9 @@
-use halo2_middleware::zal::impls::PlonkEngineConfig;
 use rand::rngs::OsRng;
 use std::io::Cursor;
 
 use ark_ec::{pairing::Pairing, CurveGroup, VariableBaseMSM};
 
+use halo2_middleware::zal::impls::PlonkEngineConfig;
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     halo2curves::{
@@ -12,14 +12,15 @@ use halo2_proofs::{
         CurveAffine,
     },
     plonk::{
-        create_proof, keygen_pk, keygen_vk, Circuit, ConstraintSystem, ErrorFront, Expression,
-        Selector,
+        create_proof, keygen_pk, keygen_vk, verify_proof_multi, Circuit, ConstraintSystem,
+        ErrorFront, Expression, Selector,
     },
     poly::{
         commitment::{Blind, CommitmentScheme, Params},
         kzg::{
             commitment::{KZGCommitmentScheme, ParamsKZG},
-            multiopen::ProverGWC,
+            multiopen::{ProverGWC, VerifierGWC},
+            strategy::SingleStrategy,
         },
         EvaluationDomain, Rotation,
     },
@@ -176,35 +177,50 @@ fn main() {
     let pk = keygen_pk(&params, vk, &circuit).expect("keygen_pk should not fail");
 
     // 6. Create a transcript for the proof
-    let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
+    let mut proof_transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
 
     // 7. Actually create the proof (this is where polynomials get committed internally)
-    create_proof::<KZGCommitmentScheme<_>, ProverGWC<_>, _, _, _, BitvectorCommitmentCircuit>(
+    create_proof::<KZGCommitmentScheme<Bn256>, ProverGWC<_>, _, _, _, BitvectorCommitmentCircuit>(
         &params,
         &pk,
         &[circuit],
         &[(&[]).to_vec()],
         OsRng,
-        &mut transcript,
+        &mut proof_transcript,
     )
     .expect("proof generation should succeed");
 
     // 8. Finalize and serialize the proof
-    let proof = transcript.finalize();
+    let proof = proof_transcript.finalize();
     println!("Proof created successfully!");
 
-    // 9. Extract our advice column commtiment from the proof
+    // 9. Verify the proof
+    let mut verifier_transcript =
+        Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
+    let verifier_params = params.verifier_params();
+
+    assert!(
+        verify_proof_multi::<KZGCommitmentScheme<Bn256>, VerifierGWC<Bn256>, _, _, SingleStrategy<_>>(
+            &verifier_params,
+            &pk.get_vk(),
+            &[(&[]).to_vec()],
+            &mut verifier_transcript,
+        ),
+        "failed to verify proof"
+    );
+
+    // 10. Extract our advice column commtiment from the proof
     let num_advice_columns = 1; // Number of advice columns in the circuit
     let commitments = extract_commitments::<KZGCommitmentScheme<Bn256>>(&proof, num_advice_columns);
 
-    // Commitment from Halo2
+    // Extract the bitvector as advice column commitment from Halo2 proof
     let halo2_commitment = commitments[0];
     println!(
         "Halo2 Commitment to the bitvector column: {:?}",
         halo2_commitment
     );
 
-    // 10. Compute the commitment from the bitvector using plain KZG
+    // 11. Compute the commitment from the bitvector using plain KZG
     let domain = EvaluationDomain::new(1, k);
 
     let fresh_bitvector = vec![Fr::zero(), Fr::zero(), Fr::one(), Fr::one()];
